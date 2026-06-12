@@ -1,0 +1,70 @@
+import nidaqmx
+from nidaqmx.constants import AcquisitionType
+import threading
+import numpy as np
+import time
+
+class DAQOutput:
+    def __init__(self, ao_channel="myDAQ2/ao0", sample_rate=10000):
+        self.ao_channel = ao_channel
+        self.sample_rate = sample_rate
+        self.task = None
+        self.is_running = False
+        self.thread = None
+
+    def start(self, shape='sinus', freq=10.0, amp=1.0, duty=50.0):
+        """Uruchamia generację w oddzielnym wątku."""
+        if self.is_running:
+            return
+            
+        self.is_running = True
+        self.thread = threading.Thread(target=self._run_ao, args=(shape, freq, amp, duty), daemon=True)
+        self.thread.start()
+        print(f"Start AO: Kształt={shape}, Freq={freq}Hz, Amp={amp}V")
+
+    def _run_ao(self, shape, freq, amp, duty):
+        # Generujemy 1 pełny okres sygnału dla bufora sprzętowego
+        samples_per_period = int(self.sample_rate / freq)
+        t = np.linspace(0, 1/freq, samples_per_period, endpoint=False)
+
+        if shape == 'sinus':
+            # Sygnał sinusoidalny
+            data = amp * np.sin(2 * np.pi * freq * t)
+        elif shape == 'pwm':
+            # Sygnał PWM (prostokątny)
+            duty_cycle_fraction = duty / 100.0
+            data = np.where((t % (1/freq)) < (duty_cycle_fraction / freq), amp, 0.0)
+
+        try:
+            self.task = nidaqmx.Task()
+            self.task.ao_channels.add_ao_voltage_chan(self.ao_channel, min_val=-10.0, max_val=10.0)
+            
+            # Konfiguracja ciągłego powtarzania tego jednego okresu
+            self.task.timing.cfg_samp_clk_timing(
+                rate=self.sample_rate,
+                sample_mode=AcquisitionType.CONTINUOUS,
+                samps_per_chan=samples_per_period
+            )
+            
+            # Wpisanie danych i start
+            self.task.write(data, auto_start=False)
+            self.task.start()
+            
+            # Pętla podtrzymująca działanie wątku
+            while self.is_running:
+                time.sleep(0.1)
+                
+        except Exception as e:
+            print(f"Błąd uruchamiania wyjścia AO: {e}")
+        finally:
+            if self.task:
+                self.task.stop()
+                self.task.close()
+                self.task = None
+
+    def stop(self):
+        """Zatrzymuje proces generacji."""
+        self.is_running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join()
+        print("Zatrzymano AO.")

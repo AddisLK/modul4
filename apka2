@@ -1,0 +1,320 @@
+import tkinter as tk
+from tkinter import messagebox, ttk
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import time
+from datetime import datetime
+
+# Importy naszych modułów
+from daq_module import DAQAcquisition
+from ao_module import DAQOutput
+
+class DAQControlApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("TestingSuiteApp - Panel DAQ (AI & AO)")
+        self.geometry("1200x800")
+        
+        # --- ZMIENNE STANU PROGRAMU ---
+        self.daq_ai = None
+        self.daq_ao = DAQOutput(ao_channel="myDAQ2/ao0")
+        
+        self.is_live = False        # Czy podgląd jest aktywny
+        self.is_measuring = False   # Czy trwa proces oceniania
+        self.auto_mode = tk.BooleanVar(value=False)
+        
+        self.plot_x = []
+        self.plot_y = []
+        self.meas_data = []         # Zebrane dane w trakcie oceniania
+        self.meas_start_time = 0
+        self.limit_failed = False   # Flaga, czy w trakcie pomiaru przekroczono limit
+        
+        self.inicjalizuj_interfejs()
+        self.aktualizuj_stan_ui("IDLE", "Gotowy do pracy", "gray")
+
+    def inicjalizuj_interfejs(self):
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # PANELA LEWY - KONFIGURACJA
+        left_panel = ttk.Frame(main_frame, width=350)
+        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
+        # 1. Konfiguracja AI i Podgląd
+        frame_ai = ttk.LabelFrame(left_panel, text=" 1. Akwizycja (AI/DI) ", padding=10)
+        frame_ai.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(frame_ai, text="Częstotliwość [Hz]:").grid(row=0, column=0, sticky="w")
+        self.ent_ai_freq = ttk.Entry(frame_ai, width=10)
+        self.ent_ai_freq.insert(0, "1000")
+        self.ent_ai_freq.grid(row=0, column=1, pady=2)
+
+        self.btn_live_start = ttk.Button(frame_ai, text="Start Akwizycji (Live)", command=self.start_live)
+        self.btn_live_start.grid(row=1, column=0, pady=10, sticky="ew")
+        
+        self.btn_live_stop = ttk.Button(frame_ai, text="Stop Akwizycji", command=self.stop_live, state=tk.DISABLED)
+        self.btn_live_stop.grid(row=1, column=1, pady=10, sticky="ew")
+
+        # 2. Parametry Oceniania (Zapis i Limity)
+        frame_meas = ttk.LabelFrame(left_panel, text=" 2. Okres Oceniania / Zapis ", padding=10)
+        frame_meas.pack(fill=tk.X, pady=5)
+
+        ttk.Label(frame_meas, text="Długość pomiaru [s]:").grid(row=0, column=0, sticky="w")
+        self.ent_duration = ttk.Entry(frame_meas, width=10)
+        self.ent_duration.insert(0, "5.0")
+        self.ent_duration.grid(row=0, column=1, pady=2)
+
+        ttk.Label(frame_meas, text="Limit MIN [V]:").grid(row=1, column=0, sticky="w")
+        self.ent_min = ttk.Entry(frame_meas, width=10)
+        self.ent_min.insert(0, "1.0")
+        self.ent_min.grid(row=1, column=1, pady=2)
+
+        ttk.Label(frame_meas, text="Limit MAX [V]:").grid(row=2, column=0, sticky="w")
+        self.ent_max = ttk.Entry(frame_meas, width=10)
+        self.ent_max.insert(0, "4.0")
+        self.ent_max.grid(row=2, column=1, pady=2)
+        
+        ttk.Checkbutton(frame_meas, text="Tryb Automatyczny", variable=self.auto_mode).grid(row=3, column=0, pady=5, sticky="w")
+        ttk.Label(frame_meas, text="Przerwa [s]:").grid(row=4, column=0, sticky="w")
+        self.ent_auto_wait = ttk.Entry(frame_meas, width=10)
+        self.ent_auto_wait.insert(0, "2.0")
+        self.ent_auto_wait.grid(row=4, column=1)
+
+        self.btn_meas_start = ttk.Button(frame_meas, text="Start Pomiaru", command=self.start_measurement, state=tk.DISABLED)
+        self.btn_meas_start.grid(row=5, column=0, pady=10, sticky="ew")
+        
+        self.btn_meas_stop = ttk.Button(frame_meas, text="Stop Pomiaru", command=self.stop_measurement, state=tk.DISABLED)
+        self.btn_meas_stop.grid(row=5, column=1, pady=10, sticky="ew")
+
+        # 3. Konfiguracja AO (Generator)
+        frame_ao = ttk.LabelFrame(left_panel, text=" 3. Generator Sygnału (AO) ", padding=10)
+        frame_ao.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(frame_ao, text="Kształt:").grid(row=0, column=0, sticky="w")
+        self.combo_shape = ttk.Combobox(frame_ao, values=["sinus", "pwm"], width=8, state="readonly")
+        self.combo_shape.set("sinus")
+        self.combo_shape.grid(row=0, column=1, pady=2)
+        
+        ttk.Label(frame_ao, text="Częstotliwość [Hz]:").grid(row=1, column=0, sticky="w")
+        self.ent_ao_freq = ttk.Entry(frame_ao, width=10)
+        self.ent_ao_freq.insert(0, "10.0")
+        self.ent_ao_freq.grid(row=1, column=1, pady=2)
+        
+        ttk.Label(frame_ao, text="Amplituda [V]:").grid(row=2, column=0, sticky="w")
+        self.ent_ao_amp = ttk.Entry(frame_ao, width=10)
+        self.ent_ao_amp.insert(0, "5.0")
+        self.ent_ao_amp.grid(row=2, column=1, pady=2)
+        
+        ttk.Label(frame_ao, text="Wypełnienie (PWM) [%]:").grid(row=3, column=0, sticky="w")
+        self.ent_ao_duty = ttk.Entry(frame_ao, width=10)
+        self.ent_ao_duty.insert(0, "50")
+        self.ent_ao_duty.grid(row=3, column=1, pady=2)
+
+        self.btn_ao_start = ttk.Button(frame_ao, text="Start AO", command=self.start_ao)
+        self.btn_ao_start.grid(row=4, column=0, pady=10, sticky="ew")
+        
+        self.btn_ao_stop = ttk.Button(frame_ao, text="Stop AO", command=self.stop_ao, state=tk.DISABLED)
+        self.btn_ao_stop.grid(row=4, column=1, pady=10, sticky="ew")
+
+        # PANEL PRAWY - WYKRES I STATUS
+        right_panel = ttk.Frame(main_frame)
+        right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        # Status Label
+        self.lbl_status = tk.Label(right_panel, text="STATUS", font=("Arial", 24, "bold"), fg="white", bg="gray", pady=10)
+        self.lbl_status.pack(fill=tk.X, pady=5)
+        
+        self.lbl_di_status = tk.Label(right_panel, text="DI: Oczekuję...", font=("Arial", 12), fg="black")
+        self.lbl_di_status.pack(fill=tk.X)
+
+        # Wykres Matplotlib
+        self.fig, self.ax = plt.subplots(figsize=(6, 4))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right_panel)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    # --- LOGIKA KONTROLI UI (Maszyna Stanów) ---
+    def aktualizuj_stan_ui(self, stan, tekst, kolor):
+        self.lbl_status.config(text=f"{stan}: {tekst}", bg=kolor)
+        
+        if stan == "IDLE":
+            self.btn_live_start.config(state=tk.NORMAL)
+            self.btn_live_stop.config(state=tk.DISABLED)
+            self.btn_meas_start.config(state=tk.DISABLED)
+            self.btn_meas_stop.config(state=tk.DISABLED)
+        elif stan == "LIVE":
+            self.btn_live_start.config(state=tk.DISABLED)
+            self.btn_live_stop.config(state=tk.NORMAL)
+            self.btn_meas_start.config(state=tk.NORMAL)
+            self.btn_meas_stop.config(state=tk.DISABLED)
+        elif stan == "MEASURING":
+            self.btn_live_stop.config(state=tk.DISABLED)
+            self.btn_meas_start.config(state=tk.DISABLED)
+            self.btn_meas_stop.config(state=tk.NORMAL)
+
+    # --- AKWIZYCJA LIVE (Bez zapisu) ---
+    def start_live(self):
+        try:
+            freq = int(self.ent_ai_freq.get())
+            self.daq_ai = DAQAcquisition(ai_channel="myDAQ2/ai0", di_channel="myDAQ2/port0/line0", sample_rate=freq)
+            self.daq_ai.start()
+            
+            self.is_live = True
+            self.plot_x = []
+            self.plot_y = []
+            self.aktualizuj_stan_ui("LIVE", "Podgląd na żywo", "orange")
+            
+            # Uruchomienie pętli odświeżania danych w GUI
+            self.after(100, self.loop_update_gui)
+            
+        except Exception as e:
+            messagebox.showerror("Błąd", str(e))
+
+    def stop_live(self):
+        self.is_live = False
+        if self.daq_ai:
+            self.daq_ai.stop()
+        self.aktualizuj_stan_ui("IDLE", "Zatrzymano", "gray")
+
+    # --- OKRES OCENIANIA (Zapis do pliku) ---
+    def start_measurement(self):
+        if not self.is_live: return
+        
+        self.is_measuring = True
+        self.meas_data = []
+        self.limit_failed = False
+        self.meas_start_time = time.time()
+        
+        self.plot_x = []
+        self.plot_y = []
+        
+        self.aktualizuj_stan_ui("MEASURING", "Zbieram i oceniam dane...", "blue")
+
+    def stop_measurement(self):
+        self.is_measuring = False
+        
+        # Ocena końcowa na ekranie
+        if self.limit_failed:
+            self.aktualizuj_stan_ui("LIVE", "PORAŻKA - Poza limitem!", "red")
+        else:
+            self.aktualizuj_stan_ui("LIVE", "SUKCES - W limicie!", "green")
+            
+        self.zapisz_do_pliku()
+        
+        # Logika trybu automatycznego
+        if self.auto_mode.get():
+            try:
+                wait_sec = float(self.ent_auto_wait.get())
+                self.aktualizuj_stan_ui("WAIT", f"Czekam {wait_sec}s przed kolejnym...", "purple")
+                self.after(int(wait_sec * 1000), self.start_measurement)
+            except ValueError:
+                messagebox.showwarning("Błąd", "Nieprawidłowy czas oczekiwania.")
+
+    def zapisz_do_pliku(self):
+        if not self.meas_data: return
+        
+        # Automatyczne generowanie nazwy pliku
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"pomiar_{timestamp}.csv"
+        
+        df = pd.DataFrame(self.meas_data)
+        df.to_csv(filename, index=False, sep=';')
+        print(f"Zapisano plik: {filename}")
+
+    # --- GŁÓWNA PĘTLA GUI (Zastępuje time.sleep) ---
+    def loop_update_gui(self):
+        if not self.is_live: return
+
+        # Pobieranie danych z bufora klasy DAQ
+        paczki = self.daq_ai.get_samples()
+        
+        if paczki:
+            for paczka in paczki:
+                t = paczka['timestamp']
+                di_state = paczka['di']
+                ai_array = paczka['ai']
+                
+                if not ai_array: continue
+                
+                # Bierzemy średnią paczki dla płynności wykresu
+                srednie_ai = sum(ai_array) / len(ai_array) 
+                
+                self.plot_x.append(t)
+                self.plot_y.append(srednie_ai)
+                
+                # Aktualizacja UI dla DI (przycisku)
+                di_text = "WCIŚNIĘTY" if di_state else "PUSZCZONY"
+                self.lbl_di_status.config(text=f"Stan DI (Przycisk): {di_text}")
+
+                # Logika pomiaru (zapis i kontrola limitów)
+                if self.is_measuring:
+                    self.meas_data.append({'time': t, 'value': srednie_ai, 'di': di_state})
+                    
+                    # Sprawdzanie limitów "w locie"
+                    try:
+                        lim_min = float(self.ent_min.get())
+                        lim_max = float(self.ent_max.get())
+                        if srednie_ai < lim_min or srednie_ai > lim_max:
+                            self.limit_failed = True
+                            self.lbl_status.config(bg="red") # Wizualna informacja podczas trwania!
+                    except:
+                        pass # Ignorujemy błędy parsowania limitów w locie
+
+            # Ograniczenie pamięci wykresu do ostatnich 100 punktów
+            if len(self.plot_x) > 100:
+                self.plot_x = self.plot_x[-100:]
+                self.plot_y = self.plot_y[-100:]
+                
+            self.odswiez_wykres()
+            
+        # Koniec pomiaru, jeśli upłynął zadany czas
+        if self.is_measuring:
+            try:
+                duration = float(self.ent_duration.get())
+                if time.time() - self.meas_start_time >= duration:
+                    self.stop_measurement()
+            except ValueError:
+                pass
+
+        # Ponowne wywołanie pętli za 100 ms
+        self.after(100, self.loop_update_gui)
+
+    def odswiez_wykres(self):
+        self.ax.clear()
+        if self.plot_x:
+            # Rysowanie linii od zera względem osi X, dla czytelności
+            rel_t = [t - self.plot_x[0] for t in self.plot_x]
+            self.ax.plot(rel_t, self.plot_y, color='#1f77b4', marker='.')
+            
+        self.ax.set_ylim(-10, 10) # Ustawienie skali Y pod napięcie -10 do +10V
+        self.ax.set_title("Ostatnie odczyty potencjometru (AI)")
+        self.ax.set_xlabel("Czas [s]")
+        self.ax.set_ylabel("Napięcie [V]")
+        self.ax.grid(True)
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    # --- KONTROLA GENERATORA (AO) ---
+    def start_ao(self):
+        shape = self.combo_shape.get()
+        try:
+            freq = float(self.ent_ao_freq.get())
+            amp = float(self.ent_ao_amp.get())
+            duty = float(self.ent_ao_duty.get())
+            
+            self.daq_ao.start(shape=shape, freq=freq, amp=amp, duty=duty)
+            self.btn_ao_start.config(state=tk.DISABLED)
+            self.btn_ao_stop.config(state=tk.NORMAL)
+            
+        except ValueError:
+            messagebox.showerror("Błąd", "Wprowadź poprawne wartości liczbowe dla AO.")
+
+    def stop_ao(self):
+        self.daq_ao.stop()
+        self.btn_ao_start.config(state=tk.NORMAL)
+        self.btn_ao_stop.config(state=tk.DISABLED)
+
+if _name_ == "_main_":
+    app = DAQControlApp()
+    app.mainloop()
